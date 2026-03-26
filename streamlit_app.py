@@ -95,11 +95,27 @@ REGION_GEO = {
     "Oceania":       {"scope": "world",           "center": {"lat": -25, "lon": 145}, "projection_scale": 3},
 }
 
-REGION_TO_NEWSAPI_COUNTRY = {
-    "North America": "us", "South America": "br", "Europe": "de",
-    "Africa": "eg", "Asia": "cn", "Oceania": "au",
+# ISO-2 codes for each country (used by NewsAPI / NewsData top-headlines)
+COUNTRY_ISO2 = {
+    "United States": "us", "Canada": "ca", "Mexico": "mx",
+    "Brazil": "br", "Argentina": "ar", "Colombia": "co",
+    "Germany": "de", "United Kingdom": "gb", "France": "fr",
+    "Italy": "it", "Spain": "es", "Ukraine": "ua", "Poland": "pl",
+    "Egypt": "eg", "Nigeria": "ng", "South Africa": "za", "Kenya": "ke",
+    "China": "cn", "India": "in", "Japan": "jp", "South Korea": "kr",
+    "Israel": "il", "Saudi Arabia": "sa", "Turkey": "tr", "Indonesia": "id",
+    "Australia": "au", "New Zealand": "nz",
 }
-REGION_TO_NEWSDATA_COUNTRY = REGION_TO_NEWSAPI_COUNTRY.copy()
+
+# Build region → list of ISO-2 codes
+REGION_ISO2_CODES = {}
+for _c in COUNTRIES:
+    _rgn = _c["region"]
+    _code = COUNTRY_ISO2.get(_c["name"])
+    if _code:
+        REGION_ISO2_CODES.setdefault(_rgn, []).append(_code)
+
+# Guardian section mapping for regions
 REGION_TO_GUARDIAN_SECTION = {
     "North America": "us-news", "Europe": "world", "Asia": "world",
     "Africa": "world", "South America": "world", "Oceania": "australia-news",
@@ -116,22 +132,42 @@ def compute_global_stress(region: str, seed: int) -> int:
 # NEWS FETCHING — MULTI-API
 # -----------------------
 
-def _fetch_newsapi(region: str, country_name: Optional[str]) -> list:
-    if not NEWSAPI_KEY:
-        return []
-    headers = {"X-Api-Key": NEWSAPI_KEY}
-    params = {"pageSize": 10}
-    url = "https://newsapi.org/v2/top-headlines"
+def _resolve_country_codes(region: str, country_name: Optional[str]) -> list:
+    """
+    Return a list of (iso2_code, display_name) pairs to query.
+    - Specific country → just that country.
+    - Region selected  → all countries in that region.
+    - Global           → one representative per region for breadth.
+    """
     if country_name:
-        params["q"] = country_name
-        if region in REGION_TO_NEWSAPI_COUNTRY:
-            params["country"] = REGION_TO_NEWSAPI_COUNTRY[region]
-        else:
-            params["language"] = "en"
+        code = COUNTRY_ISO2.get(country_name)
+        return [(code, country_name)] if code else [(None, country_name)]
+
+    if region != "Global" and region in REGION_ISO2_CODES:
+        return [
+            (COUNTRY_ISO2[c["name"]], c["name"])
+            for c in COUNTRIES if c["region"] == region and c["name"] in COUNTRY_ISO2
+        ]
+
+    # Global: pick one representative per region
+    reps = {"us": "United States", "br": "Brazil", "gb": "United Kingdom",
+            "ng": "Nigeria", "in": "India", "au": "Australia"}
+    return list(reps.items())
+
+
+def _newsapi_one(code: str, country_label: str, region: str) -> list:
+    """Fetch top-headlines for a single country code from NewsAPI."""
+    headers = {"X-Api-Key": NEWSAPI_KEY}
+    params = {"pageSize": 5}              # fewer per country so totals stay reasonable
+    if code:
+        params["country"] = code
     else:
-        params["country"] = REGION_TO_NEWSAPI_COUNTRY.get(region, "us")
+        # fallback: keyword search
+        params["q"] = country_label
+        params["language"] = "en"
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=10)
+        r = requests.get("https://newsapi.org/v2/top-headlines",
+                         params=params, headers=headers, timeout=10)
         r.raise_for_status()
         data = r.json()
     except Exception:
@@ -142,7 +178,7 @@ def _fetch_newsapi(region: str, country_name: Optional[str]) -> list:
         {
             "title": a.get("title") or "Untitled",
             "region": region,
-            "country": country_name or "N/A",
+            "country": country_label,
             "description": a.get("description") or "",
             "source_name": (a.get("source") or {}).get("name") or "Unknown",
             "url": a.get("url") or "",
@@ -152,14 +188,13 @@ def _fetch_newsapi(region: str, country_name: Optional[str]) -> list:
     ]
 
 
-def _fetch_newsdata(region: str, country_name: Optional[str]) -> list:
-    if not NEWSDATA_KEY:
-        return []
-    params = {"apikey": NEWSDATA_KEY, "language": "en", "size": 10}
-    if country_name:
-        params["q"] = country_name
+def _newsdata_one(code: str, country_label: str, region: str) -> list:
+    """Fetch latest news for a single country from NewsData."""
+    params = {"apikey": NEWSDATA_KEY, "language": "en", "size": 5}
+    if code:
+        params["country"] = code
     else:
-        params["country"] = REGION_TO_NEWSDATA_COUNTRY.get(region, "us")
+        params["q"] = country_label
     try:
         r = requests.get("https://newsdata.io/api/1/latest", params=params, timeout=10)
         r.raise_for_status()
@@ -172,7 +207,7 @@ def _fetch_newsdata(region: str, country_name: Optional[str]) -> list:
         {
             "title": a.get("title") or "Untitled",
             "region": region,
-            "country": country_name or "N/A",
+            "country": country_label,
             "description": a.get("description") or "",
             "source_name": a.get("source_name") or a.get("source_id") or "Unknown",
             "url": a.get("link") or "",
@@ -183,15 +218,21 @@ def _fetch_newsdata(region: str, country_name: Optional[str]) -> list:
 
 
 def _fetch_guardian(region: str, country_name: Optional[str]) -> list:
+    """Guardian uses keyword/section search — one call covers a region."""
     if not GUARDIAN_KEY:
         return []
-    params = {"api-key": GUARDIAN_KEY, "page-size": 10, "show-fields": "trailText", "order-by": "newest"}
+    params = {"api-key": GUARDIAN_KEY, "page-size": 10,
+              "show-fields": "trailText", "order-by": "newest"}
     if country_name:
         params["q"] = country_name
     elif region in REGION_TO_GUARDIAN_SECTION:
         params["section"] = REGION_TO_GUARDIAN_SECTION[region]
+        # Add the region name as a keyword to improve relevance
+        if region not in ("Global",):
+            params["q"] = region
     try:
-        r = requests.get("https://content.guardianapis.com/search", params=params, timeout=10)
+        r = requests.get("https://content.guardianapis.com/search",
+                         params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
     except Exception:
@@ -200,7 +241,7 @@ def _fetch_guardian(region: str, country_name: Optional[str]) -> list:
         {
             "title": a.get("webTitle") or "Untitled",
             "region": region,
-            "country": country_name or "N/A",
+            "country": country_name or region,
             "description": (a.get("fields") or {}).get("trailText") or "",
             "source_name": "The Guardian",
             "url": a.get("webUrl") or "",
@@ -211,13 +252,17 @@ def _fetch_guardian(region: str, country_name: Optional[str]) -> list:
 
 
 def _fetch_currents(region: str, country_name: Optional[str]) -> list:
+    """Currents uses keyword search — one call covers a region."""
     if not CURRENTS_KEY:
         return []
     params = {"apiKey": CURRENTS_KEY, "language": "en", "page_size": 10}
     if country_name:
         params["keywords"] = country_name
+    elif region != "Global":
+        params["keywords"] = region
     try:
-        r = requests.get("https://api.currentsapi.services/v1/latest-news", params=params, timeout=10)
+        r = requests.get("https://api.currentsapi.services/v1/latest-news",
+                         params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
     except Exception:
@@ -228,7 +273,7 @@ def _fetch_currents(region: str, country_name: Optional[str]) -> list:
         {
             "title": a.get("title") or "Untitled",
             "region": region,
-            "country": country_name or "N/A",
+            "country": country_name or region,
             "description": a.get("description") or "",
             "source_name": a.get("author") or "Unknown",
             "url": a.get("url") or "",
@@ -240,11 +285,29 @@ def _fetch_currents(region: str, country_name: Optional[str]) -> list:
 
 @st.cache_data(show_spinner="Fetching headlines\u2026", ttl=timedelta(minutes=15))
 def fetch_news(region: str, country_name: Optional[str] = None):
+    """
+    Fetch news tied to the selected region/country.
+    For country-code APIs (NewsAPI, NewsData), queries each country in the
+    region individually so results actually span the whole region.
+    For keyword APIs (Guardian, Currents), uses region name as search term.
+    """
     all_events = []
-    all_events.extend(_fetch_newsapi(region, country_name))
-    all_events.extend(_fetch_newsdata(region, country_name))
+    targets = _resolve_country_codes(region, country_name)
+
+    # Country-code APIs: query per country in the region
+    if NEWSAPI_KEY:
+        for code, label in targets:
+            all_events.extend(_newsapi_one(code, label, region))
+
+    if NEWSDATA_KEY:
+        for code, label in targets:
+            all_events.extend(_newsdata_one(code, label, region))
+
+    # Keyword-based APIs: one call with region/country name
     all_events.extend(_fetch_guardian(region, country_name))
     all_events.extend(_fetch_currents(region, country_name))
+
+    # Deduplicate by title
     seen = set()
     unique = []
     for ev in all_events:
@@ -252,6 +315,7 @@ def fetch_news(region: str, country_name: Optional[str] = None):
         if key not in seen:
             seen.add(key)
             unique.append(ev)
+
     if not unique:
         configured = sum(bool(k) for k in [NEWSAPI_KEY, NEWSDATA_KEY, GUARDIAN_KEY, CURRENTS_KEY])
         if configured == 0:
@@ -602,11 +666,17 @@ with right_col:
     advice_text = interpret_political_compass(x_axis, y_axis)
     st.markdown(advice_text)
 
-    st.markdown("### Narratives & events")
-
     selected_country_name = None
     if country and country != "All":
         selected_country_name = country
+
+    # Dynamic heading tied to what's selected
+    if selected_country_name:
+        st.markdown(f"### Narratives: {selected_country_name}")
+    elif region != "Global":
+        st.markdown(f"### Narratives: {region}")
+    else:
+        st.markdown("### Narratives: Global")
 
     events, error = fetch_news(region, selected_country_name)
 
